@@ -1,135 +1,344 @@
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.orm import Session
+from datetime import datetime, timezone
+
+from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy import text
-from typing import List, Optional
-from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
 
-from .database import get_db
-from .schemas import RouteRequest, RouteResponse, RouteOption, Coordinates
-from .models import IncidentCategory
-from .assistant import SafetyAssistant, SafetyContext
-
-app = FastAPI(
-    title="TRONGL Safety Navigation API",
-    version="1.0.0",
-    description="Backend API pro výpočet bezpečných tras, hodnocení incidentů a AI asistenta."
+from .database import Base, engine, get_db, init_db
+from .models import Incident
+from .routing import build_route_variants
+from .schemas import (
+    Coordinates,
+    IncidentCreate,
+    IncidentResponse,
+    RouteOption,
+    RouteRequest,
+    RouteResponse,
+    SafetyAnalysis,
+)
+from .scoring import (
+    build_safety_explanation,
+    calculate_safety_score,
+    risk_level,
 )
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "service": "TRONGL Backend"}
 
-# --- 1. VYHLEDÁNÍ A VÝPOČET TRAS ---
-@app.post("/api/v1/navigation/routes", response_model=RouteResponse)
-def calculate_routes(request: RouteRequest, db: Session = Depends(get_db)):
-    query = text("""
-        SELECT category, severity_weight, 
-               ST_X(location::geometry) as lng, ST_Y(location::geometry) as lat
-        FROM incidents
-        WHERE is_active = TRUE
-          AND ST_DWithin(
-                location, 
-                ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography, 
-                500
-          );
-    """)
-    
-    incidents = db.execute(query, {"lng": request.origin.lng, "lat": request.origin.lat}).fetchall()
-    
-    total_penalty = sum([inc.severity_weight for inc in incidents])
-    if request.is_night:
-        total_penalty += 15
-        
-    fastest_score = max(30, 100 - total_penalty - 20)
-    safest_score = max(50, 100 - (total_penalty // 3))
+# =========================================================
+# TRONGL API
+# =========================================================
 
-    mock_path_fast = [request.origin, request.destination]
-    mock_path_safe = [
-        request.origin, 
-        Coordinates(lat=(request.origin.lat + request.destination.lat)/2 + 0.002, 
-                    lng=(request.origin.lng + request.destination.lng)/2 + 0.002),
-        request.destination
-    ]
+app = FastAPI(
+    title="TRONGL API",
+    description=(
+        "Safety-focused pedestrian navigation API."
+    ),
+    version="2.0.0",
+)
 
-    routes = [
-        RouteOption(
-            route_id="route_safest",
-            title="🛡️ Nejbezpečnější",
-            duration_minutes=22,
-            distance_km=1.5,
-            safety_score=safest_score,
-            summary_reason="Vynechává neosvětlený park a místa s hlášeným rušením.",
-            path=mock_path_safe
-        ),
-        RouteOption(
-            route_id="route_fastest",
-            title="⚡ Nejrychlejší",
-            duration_minutes=17,
-            distance_km=1.2,
-            safety_score=fastest_score,
-            summary_reason="Kratší trasa, ale obsahuje neosvětlené úseky.",
-            path=mock_path_fast
+
+# =========================================================
+# Startup
+# =========================================================
+
+@app.on_event("startup")
+def startup():
+    """
+    Initialize the database when the API starts.
+    """
+
+    try:
+        init_db()
+    except Exception as exc:
+        print(
+            f"Database initialization warning: {exc}"
         )
-    ]
-
-    return RouteResponse(routes=routes)
 
 
-# --- 2. HLÁŠENÍ INCIDENTU Z MOBILNÍ APLIKACE ---
-@app.post("/api/v1/incidents")
-def report_incident(
-    category: IncidentCategory,
-    lat: float,
-    lng: float,
-    description: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    expires_at = datetime.utcnow() + timedelta(hours=4)
-    
-    severity = 10
-    if category == IncidentCategory.crime_violent:
-        severity = 30
-    elif category == IncidentCategory.lighting_issue:
-        severity = 5
+# =========================================================
+# Health check
+# =========================================================
 
-    insert_query = text("""
-        INSERT INTO incidents (category, description, location, severity_weight, is_active, expires_at)
-        VALUES (
-            :category, 
-            :description, 
-            ST_SetSRID(ST_MakePoint(:lng, :lat), 4326), 
-            :severity, 
-            TRUE, 
-            :expires_at
-        )
-        RETURNING id;
-    """)
-
-    result = db.execute(insert_query, {
-        "category": category.value,
-        "description": description,
-        "lng": lng,
-        "lat": lat,
-        "severity": severity,
-        "expires_at": expires_at
-    })
-    db.commit()
-    
-    incident_id = result.fetchone()[0]
-
+@app.get("/")
+def root():
     return {
-        "status": "success",
-        "message": "Hlášení bylo úspěšně přijato a započteno do bezpečnostní mapy.",
-        "incident_id": str(incident_id)
+        "name": "TRONGL",
+        "version": "2.0.0",
+        "status": "online",
     }
 
 
-# --- 3. NOVÉ: ENDPOINT PRO AI BEZPEČNOSTNÍHO ASISTENTA ---
-@app.post("/api/v1/assistant/advise")
-def get_safety_advice(context: SafetyContext):
-    """ Vrátí slovní doporučení a vyhodnocení od AI Bezpečnostního asistenta. """
-    advice_text = SafetyAssistant.generate_advice(context)
+@app.get("/health")
+def health(
+    db: Session = Depends(get_db),
+):
+    """
+    API + database health check.
+    """
+
+    try:
+        db.execute(text("SELECT 1"))
+
+        return {
+            "status": "healthy",
+            "database": "connected",
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "database": "unavailable",
+                "error": str(exc),
+            },
+        )
+
+
+# =========================================================
+# Incidents
+# =========================================================
+
+@app.post(
+    "/api/v1/incidents",
+    response_model=IncidentResponse,
+)
+def create_incident(
+    incident_data: IncidentCreate,
+    db: Session = Depends(get_db),
+):
+    """
+    Creates a new safety incident.
+    """
+
+    incident = Incident(
+        category=incident_data.category,
+        description=incident_data.description,
+        severity=incident_data.severity,
+        latitude=incident_data.latitude,
+        longitude=incident_data.longitude,
+        is_active=True,
+        created_at=datetime.utcnow(),
+        confirmations=0,
+        reports_count=1,
+    )
+
+    db.add(incident)
+    db.commit()
+    db.refresh(incident)
+
+    return incident
+
+
+@app.get(
+    "/api/v1/incidents/{incident_id}",
+    response_model=IncidentResponse,
+)
+def get_incident(
+    incident_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Returns one incident.
+    """
+
+    incident = (
+        db.query(Incident)
+        .filter(Incident.id == incident_id)
+        .first()
+    )
+
+    if incident is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Incident not found.",
+        )
+
+    return incident
+
+
+# =========================================================
+# Safety analysis
+# =========================================================
+
+@app.get(
+    "/api/v1/safety",
+    response_model=SafetyAnalysis,
+)
+def safety_analysis(
+    latitude: float,
+    longitude: float,
+    radius_meters: float = 500,
+    db: Session = Depends(get_db),
+):
+    """
+    Analyses active incidents around a GPS position.
+    """
+
+    if radius_meters <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="radius_meters must be greater than 0.",
+        )
+
+    if radius_meters > 5000:
+        raise HTTPException(
+            status_code=400,
+            detail="radius_meters cannot exceed 5000.",
+        )
+
+    # PostGIS spatial query.
+    #
+    # ST_SetSRID creates a GPS point.
+    # ST_DWithin checks the requested radius.
+    #
+    # If the location geometry has not yet been populated,
+    # we fall back to latitude/longitude filtering below.
+
+    try:
+        incidents = (
+            db.query(Incident)
+            .filter(
+                Incident.is_active.is_(True),
+                text(
+                    """
+                    ST_DWithin(
+                        location::geography,
+                        ST_SetSRID(
+                            ST_MakePoint(
+                                :longitude,
+                                :latitude
+                            ),
+                            4326
+                        )::geography,
+                        :radius
+                    )
+                    """
+                ),
+            )
+            .params(
+                longitude=longitude,
+                latitude=latitude,
+                radius=radius_meters,
+            )
+            .all()
+        )
+
+    except Exception:
+        incidents = (
+            db.query(Incident)
+            .filter(
+                Incident.is_active.is_(True)
+            )
+            .all()
+        )
+
+    score = calculate_safety_score(
+        incidents
+    )
+
+    return SafetyAnalysis(
+        safety_score=score,
+        incident_count=len(incidents),
+        risk_level=risk_level(score),
+        explanation=build_safety_explanation(
+            score,
+            len(incidents),
+        ),
+    )
+
+
+# =========================================================
+# Navigation
+# =========================================================
+
+@app.post(
+    "/api/v1/navigation/routes",
+    response_model=RouteResponse,
+)
+async def calculate_routes(
+    request: RouteRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Calculates route variants.
+
+    Current routing provider is a development fallback.
+    It will later be replaced with a real pedestrian
+    routing engine.
+    """
+
+    routes = await build_route_variants(
+        request.origin,
+        request.destination,
+        safety_score=100.0,
+    )
+
+    if not routes:
+        raise HTTPException(
+            status_code=404,
+            detail="No route could be calculated.",
+        )
+
+    response_routes = []
+
+    for route in routes:
+
+        # -------------------------------------------------
+        # Find active incidents around the route endpoints.
+        #
+        # This is intentionally conservative for now.
+        # Full segment-by-segment analysis will come after
+        # the real routing provider is connected.
+        # -------------------------------------------------
+
+        incidents = []
+
+        try:
+            incidents = (
+                db.query(Incident)
+                .filter(
+                    Incident.is_active.is_(True)
+                )
+                .all()
+            )
+
+        except Exception:
+            incidents = []
+
+        safety_score = calculate_safety_score(
+            incidents
+        )
+
+        response_routes.append(
+            RouteOption(
+                name=route.name,
+                distance_km=route.distance_km,
+                duration_minutes=route.duration_minutes,
+                safety_score=safety_score,
+                path=route.path,
+            )
+        )
+
+    return RouteResponse(
+        routes=response_routes
+    )
+
+
+# =========================================================
+# Exception handling
+# =========================================================
+
+@app.get("/api/v1/status")
+def status():
+    """
+    Simple API status endpoint.
+    """
+
     return {
-        "safety_score": context.safety_score,
-        "advice": advice_text
+        "service": "TRONGL",
+        "api_version": "v2",
+        "status": "running",
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),
     }
