@@ -124,15 +124,12 @@ def create_incident(
         category=incident_data.category,
         description=incident_data.description,
         severity=incident_data.severity,
-
         latitude=incident_data.latitude,
         longitude=incident_data.longitude,
-
         location=from_shape(
             point,
             srid=4326,
         ),
-
         is_active=True,
         created_at=datetime.utcnow(),
         confirmations=0,
