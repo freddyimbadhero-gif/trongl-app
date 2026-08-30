@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, Alert, ActivityIndicator } from 'react-native';
+import { StyleSheet, Text, View, TouchableOpacity, Alert, ActivityIndicator, Modal } from 'react-native';
 import MapView, { Marker, Polyline } from 'react-native-maps';
 import * as Location from 'expo-location';
 
@@ -10,6 +10,10 @@ export default function App() {
   const [routes, setRoutes] = useState([]);
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [loading, setLoading] = useState(true);
+  
+  // Stavy pro AI Asistenta
+  const [assistantAdvice, setAssistantAdvice] = useState('');
+  const [modalVisible, setModalVisible] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -21,11 +25,10 @@ export default function App() {
       }
 
       let currentLocation = await Location.getCurrentPositionAsync({});
-      const coords = {
+      setLocation({
         lat: currentLocation.coords.latitude,
         lng: currentLocation.coords.longitude,
-      };
-      setLocation(coords);
+      });
       setLoading(false);
     })();
   }, []);
@@ -36,7 +39,6 @@ export default function App() {
 
     try {
       const destination = { lat: location.lat + 0.008, lng: location.lng + 0.008 };
-      
       const response = await fetch(`${API_BASE_URL}/api/v1/navigation/routes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -57,18 +59,25 @@ export default function App() {
     }
   };
 
-  const reportIncident = async (category) => {
-    if (!location) return;
+  // Volání AI Bezpečnostního asistenta
+  const askAIAssistant = async () => {
+    if (!selectedRoute) return;
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/v1/incidents?category=${category}&lat=${location.lat}&lng=${location.lng}`,
-        { method: 'POST' }
-      );
-      if (response.ok) {
-        Alert.alert('🛡️ Nahlášeno', 'Děkujeme. Vaše hlášení pomůže ostatním chodcům.');
-      }
+      const response = await fetch(`${API_BASE_URL}/api/v1/assistant/advise`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          is_night: new Date().getHours() >= 22 || new Date().getHours() < 6,
+          incident_types: ["lighting_issue"],
+          safety_score: selectedRoute.safety_score
+        })
+      });
+
+      const data = await response.json();
+      setAssistantAdvice(data.advice);
+      setModalVisible(true);
     } catch (err) {
-      Alert.alert('Chyba', 'Odeslání hlášení se nepodařilo.');
+      Alert.alert('Chyba', 'AI Asistent je momentálně nedostupný.');
     }
   };
 
@@ -93,7 +102,6 @@ export default function App() {
         }}
       >
         <Marker coordinate={{ latitude: location.lat, longitude: location.lng }} title="Moje poloha" />
-        
         {selectedRoute && (
           <Polyline
             coordinates={selectedRoute.path.map(p => ({ latitude: p.lat, longitude: p.lng }))}
@@ -116,7 +124,10 @@ export default function App() {
           <Text style={styles.routeScore}>
             Skóre bezpečnosti: <Text style={{ fontWeight: 'bold', color: '#00D084' }}>{selectedRoute.safety_score}/100</Text>
           </Text>
-          <Text style={styles.routeReason}>{selectedRoute.summary_reason}</Text>
+          
+          <TouchableOpacity style={styles.aiButton} onPress={askAIAssistant}>
+            <Text style={styles.aiButtonText}>🤖 Zeptat se AI Asistenta na rizika</Text>
+          </TouchableOpacity>
 
           <View style={styles.buttonRow}>
             {routes.map((r) => (
@@ -129,15 +140,21 @@ export default function App() {
               </TouchableOpacity>
             ))}
           </View>
-
-          <TouchableOpacity 
-            style={styles.reportButton} 
-            onPress={() => reportIncident('lighting_issue')}
-          >
-            <Text style={styles.reportButtonText}>⚠️ Nahlásit neosvětlené/nebezpečné místo</Text>
-          </TouchableOpacity>
         </View>
       )}
+
+      {/* POPUP OKNO AI ASISTENTA */}
+      <Modal visible={modalVisible} transparent={true} animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>🤖 AI Bezpečnostní Asistent</Text>
+            <Text style={styles.modalText}>{assistantAdvice}</Text>
+            <TouchableOpacity style={styles.closeButton} onPress={() => setModalVisible(false)}>
+              <Text style={styles.closeButtonText}>Rozumím</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -146,36 +163,23 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   map: { width: '100%', height: '100%' },
-  topCard: {
-    position: 'absolute',
-    top: 50,
-    left: 20,
-    right: 20,
-    backgroundColor: 'white',
-    padding: 15,
-    borderRadius: 12,
-    elevation: 5,
-  },
+  topCard: { position: 'absolute', top: 50, left: 20, right: 20, backgroundColor: 'white', padding: 15, borderRadius: 12, elevation: 5 },
   cardTitle: { fontSize: 16, fontWeight: 'bold', marginBottom: 8 },
   searchButton: { backgroundColor: '#1E293B', padding: 12, borderRadius: 8, alignItems: 'center' },
   searchButtonText: { color: 'white', fontWeight: 'bold' },
-  bottomCard: {
-    position: 'absolute',
-    bottom: 30,
-    left: 20,
-    right: 20,
-    backgroundColor: 'white',
-    padding: 20,
-    borderRadius: 16,
-    elevation: 8,
-  },
+  bottomCard: { position: 'absolute', bottom: 30, left: 20, right: 20, backgroundColor: 'white', padding: 20, borderRadius: 16, elevation: 8 },
   routeTitle: { fontSize: 18, fontWeight: 'bold' },
   routeScore: { fontSize: 14, marginVertical: 4 },
-  routeReason: { fontSize: 12, color: '#64748B', marginBottom: 12 },
-  buttonRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 12 },
+  aiButton: { backgroundColor: '#F0FDFA', padding: 10, borderRadius: 8, marginVertical: 8, borderWidth: 1, borderColor: '#99F6E4' },
+  aiButtonText: { color: '#0D9488', fontWeight: 'bold', textAlign: 'center', fontSize: 12 },
+  buttonRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 },
   chipButton: { padding: 10, borderRadius: 8, backgroundColor: '#F1F5F9', flex: 0.48, alignItems: 'center' },
   chipActive: { backgroundColor: '#E2E8F0', borderWidth: 1, borderColor: '#00D084' },
   chipText: { fontSize: 12, fontWeight: 'bold' },
-  reportButton: { backgroundColor: '#FFF1F2', padding: 12, borderRadius: 8, alignItems: 'center', borderWidth: 1, borderColor: '#FECDD3' },
-  reportButtonText: { color: '#E11D48', fontWeight: 'bold', fontSize: 12 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' },
+  modalContent: { width: '85%', backgroundColor: 'white', padding: 20, borderRadius: 16, alignItems: 'center' },
+  modalTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 12 },
+  modalText: { fontSize: 14, color: '#334155', textAlign: 'center', marginBottom: 20, lineHeight: 20 },
+  closeButton: { backgroundColor: '#1E293B', paddingVertical: 10, paddingHorizontal: 24, borderRadius: 8 },
+  closeButtonText: { color: 'white', fontWeight: 'bold' }
 });
