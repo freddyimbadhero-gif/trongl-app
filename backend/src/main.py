@@ -1,14 +1,15 @@
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException
+from geoalchemy2.shape import from_shape
+from shapely.geometry import Point
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from .database import Base, engine, get_db, init_db
+from .database import get_db, init_db
 from .models import Incident
 from .routing import build_route_variants
 from .schemas import (
-    Coordinates,
     IncidentCreate,
     IncidentResponse,
     RouteOption,
@@ -29,9 +30,7 @@ from .scoring import (
 
 app = FastAPI(
     title="TRONGL API",
-    description=(
-        "Safety-focused pedestrian navigation API."
-    ),
+    description="Safety-focused pedestrian navigation API.",
     version="2.0.0",
 )
 
@@ -49,13 +48,11 @@ def startup():
     try:
         init_db()
     except Exception as exc:
-        print(
-            f"Database initialization warning: {exc}"
-        )
+        print(f"Database initialization warning: {exc}")
 
 
 # =========================================================
-# Health check
+# Root / health
 # =========================================================
 
 @app.get("/")
@@ -68,11 +65,9 @@ def root():
 
 
 @app.get("/health")
-def health(
-    db: Session = Depends(get_db),
-):
+def health(db: Session = Depends(get_db)):
     """
-    API + database health check.
+    Checks whether the API and database are available.
     """
 
     try:
@@ -94,8 +89,18 @@ def health(
         )
 
 
+@app.get("/api/v1/status")
+def status():
+    return {
+        "service": "TRONGL",
+        "api_version": "v2",
+        "status": "running",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # =========================================================
-# Incidents
+# Incident creation
 # =========================================================
 
 @app.post(
@@ -107,8 +112,13 @@ def create_incident(
     db: Session = Depends(get_db),
 ):
     """
-    Creates a new safety incident.
+    Creates a new incident and stores its PostGIS point.
     """
+
+    point = Point(
+        incident_data.longitude,
+        incident_data.latitude,
+    )
 
     incident = Incident(
         category=incident_data.category,
@@ -116,6 +126,13 @@ def create_incident(
         severity=incident_data.severity,
         latitude=incident_data.latitude,
         longitude=incident_data.longitude,
+
+        # PostGIS POINT(longitude latitude)
+        location=from_shape(
+            point,
+            srid=4326,
+        ),
+
         is_active=True,
         created_at=datetime.utcnow(),
         confirmations=0,
@@ -129,6 +146,10 @@ def create_incident(
     return incident
 
 
+# =========================================================
+# Get incident
+# =========================================================
+
 @app.get(
     "/api/v1/incidents/{incident_id}",
     response_model=IncidentResponse,
@@ -137,10 +158,6 @@ def get_incident(
     incident_id: int,
     db: Session = Depends(get_db),
 ):
-    """
-    Returns one incident.
-    """
-
     incident = (
         db.query(Incident)
         .filter(Incident.id == incident_id)
@@ -157,7 +174,7 @@ def get_incident(
 
 
 # =========================================================
-# Safety analysis
+# Safety analysis around a GPS point
 # =========================================================
 
 @app.get(
@@ -171,8 +188,20 @@ def safety_analysis(
     db: Session = Depends(get_db),
 ):
     """
-    Analyses active incidents around a GPS position.
+    Calculates the safety level around a GPS position.
     """
+
+    if not -90 <= latitude <= 90:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid latitude.",
+        )
+
+    if not -180 <= longitude <= 180:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid longitude.",
+        )
 
     if radius_meters <= 0:
         raise HTTPException(
@@ -185,14 +214,6 @@ def safety_analysis(
             status_code=400,
             detail="radius_meters cannot exceed 5000.",
         )
-
-    # PostGIS spatial query.
-    #
-    # ST_SetSRID creates a GPS point.
-    # ST_DWithin checks the requested radius.
-    #
-    # If the location geometry has not yet been populated,
-    # we fall back to latitude/longitude filtering below.
 
     try:
         incidents = (
@@ -223,18 +244,13 @@ def safety_analysis(
             .all()
         )
 
-    except Exception:
-        incidents = (
-            db.query(Incident)
-            .filter(
-                Incident.is_active.is_(True)
-            )
-            .all()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Spatial database query failed: {exc}",
         )
 
-    score = calculate_safety_score(
-        incidents
-    )
+    score = calculate_safety_score(incidents)
 
     return SafetyAnalysis(
         safety_score=score,
@@ -262,15 +278,14 @@ async def calculate_routes(
     """
     Calculates route variants.
 
-    Current routing provider is a development fallback.
-    It will later be replaced with a real pedestrian
-    routing engine.
+    The current routing provider is a development fallback.
+    It will later be replaced by a real pedestrian routing
+    engine.
     """
 
     routes = await build_route_variants(
         request.origin,
         request.destination,
-        safety_score=100.0,
     )
 
     if not routes:
@@ -284,26 +299,44 @@ async def calculate_routes(
     for route in routes:
 
         # -------------------------------------------------
-        # Find active incidents around the route endpoints.
+        # Find active incidents around the route.
         #
-        # This is intentionally conservative for now.
-        # Full segment-by-segment analysis will come after
-        # the real routing provider is connected.
+        # For now we use the route's geographic bounding
+        # area. Full segment-by-segment analysis comes with
+        # the real routing provider.
         # -------------------------------------------------
 
-        incidents = []
+        min_lat = min(
+            point.latitude
+            for point in route.path
+        )
 
-        try:
-            incidents = (
-                db.query(Incident)
-                .filter(
-                    Incident.is_active.is_(True)
-                )
-                .all()
+        max_lat = max(
+            point.latitude
+            for point in route.path
+        )
+
+        min_lon = min(
+            point.longitude
+            for point in route.path
+        )
+
+        max_lon = max(
+            point.longitude
+            for point in route.path
+        )
+
+        incidents = (
+            db.query(Incident)
+            .filter(
+                Incident.is_active.is_(True),
+                Incident.latitude >= min_lat,
+                Incident.latitude <= max_lat,
+                Incident.longitude >= min_lon,
+                Incident.longitude <= max_lon,
             )
-
-        except Exception:
-            incidents = []
+            .all()
+        )
 
         safety_score = calculate_safety_score(
             incidents
@@ -322,23 +355,3 @@ async def calculate_routes(
     return RouteResponse(
         routes=response_routes
     )
-
-
-# =========================================================
-# Exception handling
-# =========================================================
-
-@app.get("/api/v1/status")
-def status():
-    """
-    Simple API status endpoint.
-    """
-
-    return {
-        "service": "TRONGL",
-        "api_version": "v2",
-        "status": "running",
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
-    }
