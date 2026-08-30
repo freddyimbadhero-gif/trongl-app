@@ -41,10 +41,6 @@ app = FastAPI(
 
 @app.on_event("startup")
 def startup():
-    """
-    Initialize the database when the API starts.
-    """
-
     try:
         init_db()
     except Exception as exc:
@@ -52,7 +48,7 @@ def startup():
 
 
 # =========================================================
-# Root / health
+# Root
 # =========================================================
 
 @app.get("/")
@@ -64,12 +60,12 @@ def root():
     }
 
 
+# =========================================================
+# Health check
+# =========================================================
+
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
-    """
-    Checks whether the API and database are available.
-    """
-
     try:
         db.execute(text("SELECT 1"))
 
@@ -89,6 +85,10 @@ def health(db: Session = Depends(get_db)):
         )
 
 
+# =========================================================
+# API status
+# =========================================================
+
 @app.get("/api/v1/status")
 def status():
     return {
@@ -100,7 +100,7 @@ def status():
 
 
 # =========================================================
-# Incident creation
+# CREATE INCIDENT
 # =========================================================
 
 @app.post(
@@ -124,10 +124,10 @@ def create_incident(
         category=incident_data.category,
         description=incident_data.description,
         severity=incident_data.severity,
+
         latitude=incident_data.latitude,
         longitude=incident_data.longitude,
 
-        # PostGIS POINT(longitude latitude)
         location=from_shape(
             point,
             srid=4326,
@@ -147,7 +147,7 @@ def create_incident(
 
 
 # =========================================================
-# Get incident
+# GET INCIDENT
 # =========================================================
 
 @app.get(
@@ -174,7 +174,7 @@ def get_incident(
 
 
 # =========================================================
-# Safety analysis around a GPS point
+# SAFETY ANALYSIS
 # =========================================================
 
 @app.get(
@@ -188,7 +188,7 @@ def safety_analysis(
     db: Session = Depends(get_db),
 ):
     """
-    Calculates the safety level around a GPS position.
+    Calculates safety around a GPS position.
     """
 
     if not -90 <= latitude <= 90:
@@ -250,7 +250,9 @@ def safety_analysis(
             detail=f"Spatial database query failed: {exc}",
         )
 
-    score = calculate_safety_score(incidents)
+    score = calculate_safety_score(
+        incidents
+    )
 
     return SafetyAnalysis(
         safety_score=score,
@@ -264,7 +266,7 @@ def safety_analysis(
 
 
 # =========================================================
-# Navigation
+# NAVIGATION
 # =========================================================
 
 @app.post(
@@ -278,9 +280,9 @@ async def calculate_routes(
     """
     Calculates route variants.
 
-    The current routing provider is a development fallback.
-    It will later be replaced by a real pedestrian routing
-    engine.
+    The current routing provider is a development
+    fallback. A real pedestrian routing provider
+    will be connected later.
     """
 
     routes = await build_route_variants(
@@ -299,11 +301,7 @@ async def calculate_routes(
     for route in routes:
 
         # -------------------------------------------------
-        # Find active incidents around the route.
-        #
-        # For now we use the route's geographic bounding
-        # area. Full segment-by-segment analysis comes with
-        # the real routing provider.
+        # Calculate route bounding box.
         # -------------------------------------------------
 
         min_lat = min(
@@ -326,6 +324,10 @@ async def calculate_routes(
             for point in route.path
         )
 
+        # -------------------------------------------------
+        # Find active incidents inside the route area.
+        # -------------------------------------------------
+
         incidents = (
             db.query(Incident)
             .filter(
@@ -337,6 +339,10 @@ async def calculate_routes(
             )
             .all()
         )
+
+        # -------------------------------------------------
+        # Calculate safety.
+        # -------------------------------------------------
 
         safety_score = calculate_safety_score(
             incidents
