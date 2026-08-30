@@ -31,22 +31,43 @@ class IncidentCategory:
 
 class Incident(Base):
     """
-    A reported safety incident or environmental hazard.
+    Safety incident or environmental hazard.
     """
 
     __tablename__ = "incidents"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
-    category = Column(String(50), nullable=False, index=True)
+    category = Column(
+        String(50),
+        nullable=False,
+        index=True,
+    )
 
-    description = Column(Text, nullable=True)
+    description = Column(
+        Text,
+        nullable=True,
+    )
 
-    severity = Column(Integer, nullable=False, default=1)
+    severity = Column(
+        Integer,
+        nullable=False,
+        default=1,
+    )
 
-    latitude = Column(Float, nullable=False)
+    latitude = Column(
+        Float,
+        nullable=False,
+    )
 
-    longitude = Column(Float, nullable=False)
+    longitude = Column(
+        Float,
+        nullable=False,
+    )
 
     location = Column(
         Geometry(
@@ -54,10 +75,15 @@ class Incident(Base):
             srid=4326,
             spatial_index=True,
         ),
-        nullable=True,
+        nullable=False,
     )
 
-    is_active = Column(Boolean, nullable=False, default=True)
+    is_active = Column(
+        Boolean,
+        nullable=False,
+        default=True,
+        index=True,
+    )
 
     created_at = Column(
         DateTime,
