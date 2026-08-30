@@ -7,11 +7,12 @@ from datetime import datetime, timedelta
 from .database import get_db
 from .schemas import RouteRequest, RouteResponse, RouteOption, Coordinates
 from .models import IncidentCategory
+from .assistant import SafetyAssistant, SafetyContext
 
 app = FastAPI(
     title="TRONGL Safety Navigation API",
     version="1.0.0",
-    description="Backend API pro výpočet bezpečných tras a hodnocení incidentů."
+    description="Backend API pro výpočet bezpečných tras, hodnocení incidentů a AI asistenta."
 )
 
 @app.get("/health")
@@ -21,7 +22,6 @@ def health_check():
 # --- 1. VYHLEDÁNÍ A VÝPOČET TRAS ---
 @app.post("/api/v1/navigation/routes", response_model=RouteResponse)
 def calculate_routes(request: RouteRequest, db: Session = Depends(get_db)):
-    """ Vyhodnotí trasu mezi dvěma body a vrátí možnosti s bezpečnostním skóre. """
     query = text("""
         SELECT category, severity_weight, 
                ST_X(location::geometry) as lng, ST_Y(location::geometry) as lat
@@ -75,7 +75,7 @@ def calculate_routes(request: RouteRequest, db: Session = Depends(get_db)):
     return RouteResponse(routes=routes)
 
 
-# --- 2. NOVÉ: HLÁŠENÍ INCIDENTU Z MOBILNÍ APLIKACE ---
+# --- 2. HLÁŠENÍ INCIDENTU Z MOBILNÍ APLIKACE ---
 @app.post("/api/v1/incidents")
 def report_incident(
     category: IncidentCategory,
@@ -84,12 +84,8 @@ def report_incident(
     description: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """ Umožní chodci nahlásit nebezpečí přímo na své polohové souřadnice. """
-    
-    # Výpočet vypršení platnosti hlášení (standardně 4 hodiny)
     expires_at = datetime.utcnow() + timedelta(hours=4)
     
-    # Určení váhy závažnosti podle kategorie
     severity = 10
     if category == IncidentCategory.crime_violent:
         severity = 30
@@ -125,4 +121,15 @@ def report_incident(
         "status": "success",
         "message": "Hlášení bylo úspěšně přijato a započteno do bezpečnostní mapy.",
         "incident_id": str(incident_id)
+    }
+
+
+# --- 3. NOVÉ: ENDPOINT PRO AI BEZPEČNOSTNÍHO ASISTENTA ---
+@app.post("/api/v1/assistant/advise")
+def get_safety_advice(context: SafetyContext):
+    """ Vrátí slovní doporučení a vyhodnocení od AI Bezpečnostního asistenta. """
+    advice_text = SafetyAssistant.generate_advice(context)
+    return {
+        "safety_score": context.safety_score,
+        "advice": advice_text
     }
