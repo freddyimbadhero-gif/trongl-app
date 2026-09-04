@@ -1,34 +1,39 @@
-version: '3.8'
-
 services:
-  # 1. PostGIS Databáze
   db:
     image: postgis/postgis:16-3.4
     container_name: trongl_db
-    restart: always
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: trongl_user
-      POSTGRES_PASSWORD: trongl_secure_password
-      POSTGRES_DB: trongl_db
+      POSTGRES_USER: ${POSTGRES_USER:-trongl_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trongl_secure_password}
+      POSTGRES_DB: ${POSTGRES_DB:-trongl_db}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-trongl_user} -d ${POSTGRES_DB:-trongl_db}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
-  # 2. FastAPI Backend
   backend:
     build:
       context: .
       dockerfile: backend/Dockerfile
     container_name: trongl_backend
-    restart: always
+    restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     environment:
-      DATABASE_URL: postgresql://trongl_user:trongl_secure_password@db:5432/trongl_db
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://trongl_user:trongl_secure_password@db:5432/trongl_db}
     depends_on:
-      - db
+      db:
+        condition: service_healthy
 
 volumes:
   postgres_data:
