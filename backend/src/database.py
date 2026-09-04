@@ -9,8 +9,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # ---------------------------------------------------------
 
 DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg2://trongl:trongl_secure_password@db:5432/trongl",
+    "postgresql+psycopg2://trongl_user:trongl_secure_password@db:5432/trongl_db",
 )
 
 
