@@ -1,6 +1,19 @@
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from .models import IncidentCategory
+
+VALID_INCIDENT_CATEGORIES = {
+    IncidentCategory.VIOLENCE,
+    IncidentCategory.HARASSMENT,
+    IncidentCategory.THEFT,
+    IncidentCategory.SUSPICIOUS_ACTIVITY,
+    IncidentCategory.POOR_LIGHTING,
+    IncidentCategory.ROAD_HAZARD,
+    IncidentCategory.ACCIDENT,
+    IncidentCategory.OTHER,
+}
 
 
 # =========================================================
@@ -89,6 +102,15 @@ class IncidentCreate(BaseModel):
         le=180,
     )
 
+    @field_validator("category")
+    @classmethod
+    def validate_category(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in VALID_INCIDENT_CATEGORIES:
+            allowed = ", ".join(sorted(VALID_INCIDENT_CATEGORIES))
+            raise ValueError(f"Invalid category '{value}'. Allowed values: {allowed}.")
+        return normalized
+
 
 # =========================================================
 # Incident response
@@ -128,3 +150,5 @@ class SafetyAnalysis(BaseModel):
     risk_level: str
 
     explanation: Optional[str] = None
+
+    advice: Optional[str] = None
