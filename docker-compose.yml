@@ -2,7 +2,7 @@ services:
   db:
     image: postgis/postgis:16-3.4
     container_name: trongl_db
-    restart: unless-stopped
+    restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-trongl_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trongl_secure_password}
@@ -26,7 +26,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     container_name: trongl_backend
-    restart: unless-stopped
+    restart: always
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     environment:
