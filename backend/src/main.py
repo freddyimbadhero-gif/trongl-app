@@ -1,11 +1,14 @@
 from datetime import datetime, timezone
+from math import cos, radians
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from geoalchemy2.shape import from_shape
 from shapely.geometry import Point
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .assistant import SafetyAssistant, SafetyContext
 from .database import get_db, init_db
 from .models import Incident
 from .routing import build_route_variants
@@ -19,7 +22,9 @@ from .schemas import (
 )
 from .scoring import (
     build_safety_explanation,
+    calculate_route_safety_score,
     calculate_safety_score,
+    is_location_night,
     risk_level,
 )
 
@@ -32,6 +37,14 @@ app = FastAPI(
     title="TRONGL API",
     description="Safety-focused pedestrian navigation API.",
     version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -131,7 +144,7 @@ def create_incident(
             srid=4326,
         ),
         is_active=True,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
         confirmations=0,
         reports_count=1,
     )
@@ -221,22 +234,15 @@ def safety_analysis(
                     """
                     ST_DWithin(
                         location::geography,
-                        ST_SetSRID(
-                            ST_MakePoint(
-                                :longitude,
-                                :latitude
-                            ),
-                            4326
-                        )::geography,
+                        ST_SetSRID(ST_MakePoint(:longitude, :latitude), 4326)::geography,
                         :radius
                     )
                     """
+                ).bindparams(
+                    longitude=longitude,
+                    latitude=latitude,
+                    radius=radius_meters,
                 ),
-            )
-            .params(
-                longitude=longitude,
-                latitude=latitude,
-                radius=radius_meters,
             )
             .all()
         )
@@ -251,6 +257,16 @@ def safety_analysis(
         incidents
     )
 
+    is_night = is_location_night(latitude, longitude)
+
+    advice = SafetyAssistant.generate_advice(
+        SafetyContext(
+            is_night=is_night,
+            incident_types=[incident.category for incident in incidents],
+            safety_score=int(score),
+        )
+    )
+
     return SafetyAnalysis(
         safety_score=score,
         incident_count=len(incidents),
@@ -259,6 +275,7 @@ def safety_analysis(
             score,
             len(incidents),
         ),
+        advice=advice,
     )
 
 
@@ -282,72 +299,82 @@ async def calculate_routes(
     will be connected later.
     """
 
-    routes = await build_route_variants(
+    candidates = await build_route_variants(
         request.origin,
         request.destination,
     )
 
-    if not routes:
-        raise HTTPException(
-            status_code=404,
-            detail="No route could be calculated.",
-        )
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No route could be calculated.")
 
-    response_routes = []
+    evaluated = []
+    for route in candidates:
+        min_lat = min(point.latitude for point in route.path)
+        max_lat = max(point.latitude for point in route.path)
+        min_lon = min(point.longitude for point in route.path)
+        max_lon = max(point.longitude for point in route.path)
 
-    for route in routes:
-
-        # -------------------------------------------------
-        # Calculate route bounding box.
-        # -------------------------------------------------
-
-        min_lat = min(
-            point.latitude
-            for point in route.path
-        )
-
-        max_lat = max(
-            point.latitude
-            for point in route.path
-        )
-
-        min_lon = min(
-            point.longitude
-            for point in route.path
-        )
-
-        max_lon = max(
-            point.longitude
-            for point in route.path
-        )
-
-        # -------------------------------------------------
-        # Find active incidents inside the route area.
-        # -------------------------------------------------
+        corridor_meters = 150.0
+        lat_margin = corridor_meters / 111_320.0
+        mean_lat = (min_lat + max_lat) / 2.0
+        lon_scale = max(0.01, cos(radians(mean_lat)))
+        lon_margin = corridor_meters / (111_320.0 * lon_scale)
 
         incidents = (
             db.query(Incident)
             .filter(
                 Incident.is_active.is_(True),
-                Incident.latitude >= min_lat,
-                Incident.latitude <= max_lat,
-                Incident.longitude >= min_lon,
-                Incident.longitude <= max_lon,
+                Incident.latitude >= min_lat - lat_margin,
+                Incident.latitude <= max_lat + lat_margin,
+                Incident.longitude >= min_lon - lon_margin,
+                Incident.longitude <= max_lon + lon_margin,
             )
             .all()
         )
 
-        # -------------------------------------------------
-        # Calculate safety.
-        # -------------------------------------------------
+        safety_score = calculate_route_safety_score(incidents, route.path)
+        evaluated.append((route, safety_score))
 
-        safety_score = calculate_safety_score(
-            incidents
-        )
+    # Pick labels from the actual candidate routes. Fastest is time-based,
+    # safest is safety-score based. Balanced minimizes normalized time and risk.
+    fastest = min(evaluated, key=lambda item: item[0].duration_minutes)
+    safest = max(evaluated, key=lambda item: item[1])
+    min_time = min(item[0].duration_minutes for item in evaluated)
+    max_time = max(item[0].duration_minutes for item in evaluated)
 
+    def balanced_key(item):
+        route, safety = item
+        time_norm = 0.0 if max_time == min_time else (route.duration_minutes - min_time) / (max_time - min_time)
+        risk_norm = 1.0 - safety / 100.0
+        return 0.45 * time_norm + 0.55 * risk_norm
+
+    balanced = min(evaluated, key=balanced_key)
+
+    # Keep all returned candidates distinct; a candidate may have more than one label
+    # in degenerate cases, so prefer fastest/balanced/safest in that order and fill the rest.
+    ordered = []
+    for label, selected in (("fastest", fastest), ("balanced", balanced), ("safest", safest)):
+        if selected not in ordered:
+            ordered.append(selected)
+        elif len(ordered) < len(evaluated):
+            remaining = [x for x in evaluated if x not in ordered]
+            if remaining:
+                ordered.append(remaining[0])
+
+    # Ensure the response has every available route exactly once.
+    for item in evaluated:
+        if item not in ordered:
+            ordered.append(item)
+
+    label_by_item = {id(fastest): "fastest", id(balanced): "balanced", id(safest): "safest"}
+    response_routes = []
+    fallback_labels = ["fastest", "balanced", "safest"]
+    for index, item in enumerate(ordered):
+        route, safety_score = item
+        name = label_by_item.get(id(item), fallback_labels[index] if index < 3 else f"alternative_{index}")
         response_routes.append(
             RouteOption(
-                name=route.name,
+                name=name,
                 distance_km=route.distance_km,
                 duration_minutes=route.duration_minutes,
                 safety_score=safety_score,
