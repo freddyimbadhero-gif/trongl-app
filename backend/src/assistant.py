@@ -17,10 +17,16 @@ class SafetyAssistant:
         if context.is_night:
             advice.append("Doporučujeme mít po ruce rozsvícenou svítilnu a jít po osvětleném chodníku.")
             
-        if "lighting_issue" in context.incident_types:
+        if "poor_lighting" in context.incident_types:
             advice.append("Na trase je nahlášena nefunkční pouliční lampa – vyhněte se temným koutům.")
-            
-        if "crime_violent" in context.incident_types or "suspicious_activity" in context.incident_types:
+
+        if "violence" in context.incident_types or "suspicious_activity" in context.incident_types:
             advice.append("V oblasti bylo nahlášeno zvýšené riziko. Zvažte sdílení živé polohy s osobou blízko vás.")
+
+        if "harassment" in context.incident_types:
+            advice.append("V oblasti bylo nahlášeno obtěžování. Zvažte alternativní trasu nebo doprovod.")
+
+        if "theft" in context.incident_types:
+            advice.append("V okolí bylo nahlášeno krádeže – mějte cennosti mimo dohled.")
 
         return " ".join(advice) if advice else "Zvýšená opatrnost je na místě. Sledujte své okolí."
